@@ -1,9 +1,12 @@
 """
 Multi-Agent Customer Support Demo
 Built with LangGraph, LangChain, and Gradio
-
 FIX #3:  _extract_response now collects responses from ALL agents, not just the last one.
 FIX #15: Added logging for response extraction debugging.
+FIX #G6: Use messages format (dicts with role/content) for Chatbot history.
+FIX #G7: Moved css and theme back into gr.Blocks() — launch() ignores them in this version.
+FIX #G8: Added show_label=False to Chatbot to hide the "Chatbot" header label.
+FIX #G9: Fixed examples CSS — force single-column layout, allow text wrapping, no truncation.
 """
 
 import os
@@ -43,13 +46,16 @@ def initialize_system():
 
     try:
         from database import verify_database
+
         if not verify_database():
             _init_error = "Failed to download or initialize the Chinook database."
             logger.error(_init_error)
             return False
+
         logger.info("Database initialized OK.")
 
         from graph_builder import build_graph
+
         _graph, _checkpointer, _store = build_graph(
             model_name=model_name,
             openai_api_key=api_key,
@@ -98,24 +104,17 @@ class ConversationManager:
 # Response Extraction (FIX #3)
 # ─────────────────────────────────────────────
 
-# Messages to skip (internal routing / verification noise)
 _SKIP_PREFIXES = (
     "Customer verified successfully",
     "The verified customer_id",
 )
-
 _SKIP_NAME_PATTERNS = ("transfer_to_",)
 
 
 def _extract_response(result):
     """
     Extract the final user-facing response from the graph result.
-
-    FIX #3: Instead of returning only the LAST ai message, this now:
-    1. Collects substantive AI responses from all agents.
-    2. If the supervisor produced a final combined response (last AI message),
-       use that (since the supervisor prompt now instructs it to combine answers).
-    3. If the supervisor's response is thin or empty, concatenate all agent responses.
+    FIX #3: Collects substantive AI responses from all agents, not just the last one.
     """
     if not result or "messages" not in result:
         return "I could not generate a response. Please try again."
@@ -129,23 +128,14 @@ def _extract_response(result):
         name = getattr(msg, "name", "")
         tool_calls = getattr(msg, "tool_calls", None)
 
-        # Skip non-AI messages
         if msg_type in ("tool", "system", "human"):
             continue
-
-        # Skip empty messages
         if not content or not content.strip():
             continue
-
-        # Skip routing / transfer messages
         if any(pattern in (name or "") for pattern in _SKIP_NAME_PATTERNS):
             continue
-
-        # Skip internal verification messages
         if any(content.startswith(prefix) for prefix in _SKIP_PREFIXES):
             continue
-
-        # Skip tool-call-only messages (no user-facing content)
         if tool_calls and not content.strip():
             continue
 
@@ -154,14 +144,10 @@ def _extract_response(result):
     if not ai_responses:
         return "I have processed your request. Is there anything else I can help with?"
 
-    # The supervisor should produce a combined final response as the last message.
-    # Use the last response, which should be the supervisor's combined answer.
-    # If it's very short (< 20 chars), it might be a routing artifact; fall back to combining all.
     last_response = ai_responses[-1]
     if len(last_response) >= 20:
         return last_response
 
-    # Fallback: combine all unique substantive responses
     seen = set()
     combined = []
     for resp in ai_responses:
@@ -172,20 +158,20 @@ def _extract_response(result):
     if combined:
         return "\n\n".join(combined)
 
-    # Final fallback
     return last_response
 
 
 # ─────────────────────────────────────────────
-# Chat Logic
+# Chat Logic  (FIX #G6: messages format)
 # ─────────────────────────────────────────────
+
 def make_status(kind, text):
     icons = {"ok": "✅", "verify": "🔐", "chat": "💬", "error": "⚠️", "new": "🆕"}
     return f"{icons.get(kind, '')} {text}"
 
 
 def add_user_message(user_msg, history):
-    """Step 1: instantly show the user message and clear input."""
+    """Append the user message as a messages-format dict and clear input."""
     if not user_msg or not user_msg.strip():
         return history, ""
     history = history + [{"role": "user", "content": user_msg}]
@@ -193,7 +179,7 @@ def add_user_message(user_msg, history):
 
 
 def run_agent(history, session_state):
-    """Step 2: run the agent on the last user message and append the reply."""
+    """Run the agent and append assistant reply as a messages-format dict."""
     from langchain_core.messages import HumanMessage
     from langgraph.types import Command
 
@@ -286,7 +272,6 @@ EXAMPLES = [
     "My customer ID is 3. What is my most recent purchase? Also, what albums do you have by U2?",
 ]
 
-
 # ─────────────────────────────────────────────
 # CSS
 # ─────────────────────────────────────────────
@@ -320,6 +305,12 @@ body, .gradio-container {
     opacity: 0.6; letter-spacing: 0.01em;
     white-space: nowrap;
 }
+/* Hide the "Chatbot" label */
+.chat-wrap > label,
+.chat-wrap > .label-wrap,
+.chat-wrap > span.svelte-1gfkn6j {
+    display: none !important;
+}
 .chat-wrap .chatbot { border-radius: 12px !important; }
 .chat-wrap .message-wrap { padding: 0.5rem !important; }
 .status-strip textarea,
@@ -346,6 +337,8 @@ body, .gradio-container {
     font-size: 0.88rem !important;
     min-height: 42px !important;
 }
+
+/* ── FIX #G9: Examples — single column, full text, no truncation ── */
 .examples-block {
     margin-top: 0.6rem;
     padding-top: 0.5rem;
@@ -357,18 +350,60 @@ body, .gradio-container {
     text-transform: uppercase !important; letter-spacing: 0.05em !important;
     font-weight: 600 !important;
 }
+
+/* Force the examples gallery into a single column */
+.examples-block .gallery,
+.examples-block .gallery-item,
+.examples-block .examples-table,
+.examples-block .examples-table tbody,
+.examples-block .examples-table tr,
+.examples-block .examples-table td {
+    display: block !important;
+    width: 100% !important;
+}
+
+/* Force the examples grid wrapper to single column */
+.examples-block .gallery {
+    grid-template-columns: 1fr !important;
+    display: grid !important;
+    gap: 0.35rem !important;
+}
+
+/* Make sure example buttons show full text */
+.examples-block button,
 .examples-block button.gallery-item,
 .examples-block .examples-table button {
     font-size: 0.82rem !important;
-    padding: 0.45rem 0.8rem !important;
+    padding: 0.5rem 0.85rem !important;
     border-radius: 8px !important;
     border: 1px solid rgba(255,255,255,0.07) !important;
     transition: border-color 0.15s ease !important;
+    white-space: normal !important;
+    word-break: break-word !important;
+    overflow: visible !important;
+    text-overflow: unset !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: unset !important;
+    text-align: left !important;
+    line-height: 1.4 !important;
 }
+.examples-block button:hover,
 .examples-block button.gallery-item:hover,
 .examples-block .examples-table button:hover {
     border-color: rgba(255,255,255,0.2) !important;
 }
+
+/* Also target the inner span/text inside example buttons */
+.examples-block button span,
+.examples-block button div,
+.examples-block button p {
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: unset !important;
+}
+
 .ftr {
     text-align: center; font-size: 0.68rem; opacity: 0.28;
     padding: 0.7rem 0 0.5rem; letter-spacing: 0.015em;
@@ -389,7 +424,11 @@ footer { display: none !important; }
 # Build UI
 # ─────────────────────────────────────────────
 def build_demo():
-    with gr.Blocks(css=CSS, title="Multi-Agent Customer Support", theme=gr.themes.Base()) as app:
+    with gr.Blocks(
+        title="Multi-Agent Customer Support",
+        css=CSS,
+        theme=gr.themes.Base(),
+    ) as app:
 
         # Header
         gr.HTML("""
@@ -412,10 +451,9 @@ def build_demo():
         # Chat
         chatbot = gr.Chatbot(
             value=[],
-            type="messages",
             height=480,
-            show_copy_button=True,
-            placeholder="Send a message or click an example below to get started…",
+            show_label=False,
+            label=None,
             elem_classes=["chat-wrap"],
         )
 
@@ -506,4 +544,9 @@ if not _ok:
 demo = build_demo()
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, show_error=True)
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,
+        show_error=True,
+    )
