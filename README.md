@@ -10,543 +10,329 @@ app_file: app.py
 pinned: false
 ---
 
-# Multi-Agent Customer Support System
+# Music Store Multi-Agent Support
 
-A production-grade, **LangGraph-powered hierarchical multi-agent assistant** for a digital music store. It combines a **Supervisor router**, two specialized **ReAct sub-agents** (music catalog + invoice information), **human-in-the-loop identity verification**, **long-term per-customer memory**, and a **Gradio chat UI** - all backed by a real relational schema (the Chinook sample database).
+A production-shaped LangGraph multi-agent assistant for a digital music store: identity-verified, tool-grounded, supervisor-routed, and runnable in a single Python process.
 
-**Live Demo:** [huggingface.co/spaces/animeshkcm/Multi-Agent-Customer-Support](https://huggingface.co/spaces/animeshkcm/Multi-Agent-Customer-Support)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
+[![Built with LangGraph](https://img.shields.io/badge/built%20with-LangGraph-9cf.svg)](https://github.com/langchain-ai/langgraph)
+[![UI: Gradio](https://img.shields.io/badge/UI-Gradio-orange.svg)](https://gradio.app)
+[![Hugging Face Space](https://img.shields.io/badge/HF%20Space-live%20demo-yellow.svg)](https://huggingface.co/spaces/animeshkcm/Multi-Agent-Customer-Support)
+[![CI](https://github.com/ANI-IN/Multi-Agent-Customer-Support/actions/workflows/ci.yml/badge.svg)](https://github.com/ANI-IN/Multi-Agent-Customer-Support/actions/workflows/ci.yml)
 
----
+## What This Is
 
-## Capstone Framing
+This project is a chat assistant for a fictional digital music store. A customer can ask about albums, tracks, artists, and genres, and (after verifying their identity) about their own purchases. Behind the scenes, a hierarchical agent graph splits responsibilities so the assistant cannot hallucinate accounts, leak data across customers, or invent invoice totals. The whole thing runs locally as a Gradio web app, in a Docker container, or on Hugging Face Spaces.
 
-This project is designed as an advanced AI engineering capstone, going beyond a simple agent or tool-calling demo. It represents a fully assembled multi-agent AI system incorporating structured state management, persistent memory, safety controls, deterministic execution, and real-world data integration. Each architectural decision such as grounding rules, memory merge semantics, supervisor-based routing, verification gating, and deterministic SQL generation directly addresses known failure modes observed in production-scale LLM systems.
+**Live demo:** [huggingface.co/spaces/animeshkcm/Multi-Agent-Customer-Support](https://huggingface.co/spaces/animeshkcm/Multi-Agent-Customer-Support)
 
-### Problem Statement
+## Table of Contents
 
-Customer support for a catalog-and-billing business has two opposing requirements:
+- [What This Is](#what-this-is)
+- [The Problem](#the-problem)
+- [The Solution](#the-solution)
+- [Who It Is For and Use Cases](#who-it-is-for-and-use-cases)
+- [Key Features](#key-features)
+- [Demo](#demo)
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Running the App](#running-the-app)
+- [Using the App Step by Step](#using-the-app-step-by-step)
+- [Code Walkthrough](#code-walkthrough)
+- [Sample Data](#sample-data)
+- [Customization](#customization)
+- [Troubleshooting](#troubleshooting)
+- [Project Structure](#project-structure)
+- [Security Notes](#security-notes)
+- [Contributing](#contributing)
+- [License](#license)
+- [Acknowledgments](#acknowledgments)
 
-1. **Conversational flexibility** - customers ask in free-form natural language (“what's my most expensive track?”, “any rock albums from AC/DC?”).
-2. **Operational correctness** - invoice totals, track IDs, and customer accounts must be exact, auditable, and access-controlled.
+## The Problem
 
-A single LLM with a single system prompt cannot satisfy both: it will either hallucinate when asked for unavailable data, or leak account data across customers, or route off-topic questions to SQL tools. This project solves that gap with a **hierarchical agent graph** where each responsibility is isolated into its own node.
+Customer support for a catalog and billing business sits between two opposing pressures:
 
-### Business Use Case
+- **Customers ask in free-form natural language.** "What's my most expensive track?", "Any rock albums by AC/DC?", "Who helped me last month?".
+- **Operational answers must be exact.** Invoice totals, track IDs, customer accounts, and support reps must be precise, auditable, and never mixed across customers.
 
-A digital music store with **59 customers**, **412 invoices**, **3,503 tracks**, **275 artists**, and **25 genres** (Chinook dataset). The assistant supports three user journeys:
+A single LLM with a single system prompt cannot satisfy both. Without strong scaffolding it will hallucinate albums it has not seen, round invoice totals, route off-topic questions to SQL tools, or worse, return one customer's invoices to another. The cost of getting any one of these wrong in production ranges from "embarrassing chat log" to "regulatory incident."
 
-| Journey | Entry Point | Guardrails |
-|---|---|---|
-| **Catalog discovery** (anonymous) | Any music question | Tool-grounded only; no PII access |
-| **Account lookup** (identified) | Customer ID, email, or phone | Human-in-the-loop verification before any invoice tool runs |
-| **Personalized recall** (returning) | Verified customer | Music preferences persisted across sessions, merge-only, never deleted |
+## The Solution
 
-### Why This Matters for AI Engineers
+This project solves the gap by splitting responsibilities into a hierarchical agent graph. Each capability lives in its own node with its own contract, and the graph wiring (not the LLM) is what enforces correctness.
 
-The project exercises the full surface area an AI engineer ships in production:
+| Pain | Capability in this project |
+|---|---|
+| Hallucinated albums or prices | Tool-only grounding rules; every sub-agent prompt forbids answering from model memory |
+| Cross-customer data leaks | `customer_id` is set by `verify_info` only and passed via `SystemMessage`; the invoice agent reads it from there, not from user text |
+| Random sampling that changes every call | `get_songs_by_genre` uses a CTE with `ROW_NUMBER()` so the same question returns the same answer |
+| Off-topic questions touching SQL | Supervisor refuses out-of-scope queries before routing to any sub-agent |
+| Memory write that erases prior data | `create_memory` is a set union and skips writes when the LLM returns empty against a non-empty profile |
+| Identity laundering through chat history | The `customer_id` field is write-once per session by `verify_info`; sub-agents and tools cannot mutate it |
 
-- **Graph-native orchestration** (not a flat ReAct loop) with conditional edges, interrupts, and a supervisor router.
-- **Typed shared state** (`TypedDict` + `add_messages` reducer) instead of ad-hoc dicts.
-- **Structured LLM output** (Pydantic schemas) for identifier extraction and preference capture - no regex parsing of model text.
-- **Prompt engineering as a contract**: every sub-agent prompt enforces explicit grounding, exact quoting, and scope boundaries.
-- **Deterministic SQL under an LLM** (CTE + `ROW_NUMBER()`) so the same question returns the same answer.
-- **Two memory modes**: short-term per-thread (`MemorySaver` checkpointer) and long-term per-customer (`InMemoryStore`).
-- **Streaming execution** via `graph.stream(..., stream_mode="updates")` wired to a Gradio chat UI with live status and interrupt handling.
+The result is "LLM plus tools" turned into a **system** with predictable invariants you can test for.
 
-### Technical Complexity
+## Who It Is For and Use Cases
 
-| Dimension | What's hard | How it's solved |
-|---|---|---|
-| **Routing** | Music vs invoice vs mixed vs off-topic | `langgraph-supervisor` with explicit routing rules in the system prompt |
-| **Identity** | Accept ID / email / phone in free text without trusting user-extracted IDs downstream | Pydantic `UserInput` + DB lookup; verified `customer_id` is injected via `SystemMessage` only |
-| **Hallucination** | LLMs invent albums, prices, totals | Tool-only responses enforced in every prompt; "I could not find…" fallback wording is scripted |
-| **Determinism** | `LIMIT 10` on a genre returns different artists each call | `ROW_NUMBER() OVER (PARTITION BY ArtistId ORDER BY TrackId)` CTE → stable sample |
-| **Memory merge** | LLM summarization can erase prior preferences | Set-union on `music_preferences`; empty output is ignored if existing memory exists |
-| **Interrupts** | Verification needs a second user turn without losing graph state | LangGraph `interrupt()` + thread-scoped checkpointer; UI reads `snapshot.next` to detect pause |
-| **SQL safety** | LLM-driven inputs could inject SQL | 100% parameterized via SQLAlchemy `text()` bindings; `_safe_int()` on all numeric args |
+This is both a working chat assistant and a reference implementation of multi-agent patterns for AI engineers.
 
-### The Engineering Challenge
+### 1. Catalog discovery for an anonymous shopper
 
-The hardest part was **not** building any one agent. It was composing them so:
+- **Persona.** A potential customer browsing the store before signing up.
+- **Situation.** "Do you carry any AC/DC albums?" "What jazz tracks do you have?"
+- **Outcome.** The supervisor routes to the music sub-agent, which calls the catalog tools and answers from real rows. No account access is required, no PII is exposed.
 
-1. The supervisor cannot bypass verification.
-2. The music agent cannot read invoices.
-3. The invoice agent cannot guess a customer ID from the conversation.
-4. Memory writes cannot erase prior data.
-5. The whole thing is observable (every tool call is logged with input and output length) and testable (28 pytest tests over tools + DB).
+### 2. Account lookup for a verified customer
 
-Those constraints are what turn "LLM + tools" into a **system**.
+- **Persona.** An existing customer with a question about their own purchases.
+- **Situation.** "What did I pay on my last invoice?" "Who was the support rep?"
+- **Outcome.** The graph pauses at `human_input` if the identity is unknown, performs a database lookup once verified, and only then lets the invoice sub-agent see the customer's data.
 
----
+### 3. Personalized recall for a returning customer
 
-## System Architecture
+- **Persona.** A repeat customer who has expressed musical preferences in earlier turns.
+- **Situation.** "What genres do you think I would like?"
+- **Outcome.** `load_memory` reads the per-customer profile from the long-term store and injects it into the music agent's prompt so it can personalize without re-asking.
 
-### High Level System Architecture
+### 4. Reference architecture for AI engineers
+
+- **Persona.** An engineer learning how to build production-shaped agent systems.
+- **Situation.** They want to see structured-output verification, parameterized SQL under an LLM, deterministic sampling, set-union memory writes, and `interrupt`-based human-in-the-loop in one repository.
+- **Outcome.** Every pattern is in one ~1,650-line Python codebase with 28 deterministic tests.
+
+## Key Features
+
+User-facing:
+
+- Two specialized assistants behind one chat window: music catalog and invoice information.
+- Identity verification by customer ID, email, or phone (international formats normalized).
+- Per-customer music preference memory that survives across turns in a session.
+- Streaming status bar that shows when the agent is thinking, which data sources were used, and how long each turn took.
+- One-click "New Conversation" that issues a fresh thread ID and clears the chat.
+
+Technical:
+
+- Hierarchical LangGraph state machine with conditional edges, interrupts, and a supervisor router.
+- Typed shared state via `TypedDict` plus an `add_messages` reducer.
+- Structured LLM outputs (Pydantic `UserInput`, `UserProfile`) instead of regex parsing.
+- 100% parameterized SQL through SQLAlchemy `text()` bindings; numeric tool arguments validated by `_safe_int`.
+- Deterministic genre sampling via a CTE with `ROW_NUMBER() OVER (PARTITION BY ArtistId ORDER BY TrackId)`.
+- Per-thread checkpointing (`MemorySaver`) and per-customer long-term store (`InMemoryStore`).
+- 28 pytest tests covering the SQL helpers and every tool function, deterministic and offline (no LLM calls).
+
+Intentionally not included:
+
+- Persistent storage. Both the checkpointer and the long-term store are in-memory by design. The README and architecture doc explain where to swap them in.
+- A multi-tenant authentication layer. The project demonstrates identity verification against a sample dataset; production tenants would need a real auth provider in front.
+- Streaming individual tokens. The UI streams at LangGraph node-event granularity, which is enough for a snappy feel without a custom token pump.
+
+## Demo
+
+The Gradio UI in a typical verified session looks like this:
+
+```
++---------------------------------------------------------------+
+|  Music Store Assistant                                        |
+|  Welcome! I can help you explore our music catalog,           |
+|  look up invoices, and find your purchase history.            |
++---------------------------------------------------------------+
+|                                                               |
+|  You:        My customer ID is 5                              |
+|                                                               |
+|  Assistant:  Hi Frantisek! I have verified your account.      |
+|              How can I help today?                            |
+|                                                               |
+|  You:        What was my most recent purchase?                |
+|                                                               |
+|  Assistant:  Your most recent invoice is #382 dated           |
+|              2025-08-07 for $8.91. It included:               |
+|              - Per Te (Pavarotti), $0.99 x 1                  |
+|              ...                                              |
+|                                                               |
++---------------------------------------------------------------+
+| [v] Responded in 1.4s | Data sources: invoice_lookup          |
++---------------------------------------------------------------+
+| Type your message here...                            [ Send ] |
++---------------------------------------------------------------+
+| [ New Conversation ]                                          |
++---------------------------------------------------------------+
+```
+
+The status bar at the bottom shows the current state (`Ready`, `Processing`, `Waiting for your input`, `Responded in N.Ns`) and the data sources that were touched during the last turn (`music_catalog`, `invoice_lookup`, or both).
+
+The live deployment on Hugging Face Spaces is linked at the top of this README.
+
+## Architecture
+
+The system is a hierarchical state machine. A user message enters `verify_info`, optionally pauses for identity verification, loads any persisted preferences, dispatches to a sub-agent via the supervisor, records updated memory, and returns the response.
 
 ```mermaid
 flowchart TD
-    User([User])
-    UI[Gradio Chat UI<br/>src/ui/app.py]
-    Graph[Multi-Agent Graph<br/>src/agents/graph.py]
-
-    subgraph Outer[Outer Graph - Orchestration]
-        Verify[verify_info]
-        Human[human_input<br/>interrupt]
-        Load[load_memory]
-        Save[create_memory]
-    end
-
-    Sup[Supervisor<br/>langgraph-supervisor]
-
-    subgraph Music[Music Catalog Sub-Agent]
-        MA[music_assistant<br/>ReAct]
-        MT[music_tool_node<br/>5 tools]
-    end
-
-    subgraph Invoice[Invoice Sub-Agent]
-        IR[create_react_agent<br/>4 tools]
-    end
-
-    DB[(Chinook SQLite<br/>in-memory)]
-    Store[(InMemoryStore<br/>per-customer memory)]
-    Ckpt[(MemorySaver<br/>per-thread history)]
-
-    User -->|message| UI
-    UI -->|graph.stream| Graph
-    Graph --> Verify
-    Verify -->|no customer_id| Human
+    User([Browser]) -->|message| UI[Gradio UI]
+    UI -->|graph.stream| Outer[Outer multi-agent graph]
+    Outer --> Verify[verify_info]
+    Verify -->|customer_id is None| Human[human_input<br/>interrupt]
     Human --> Verify
-    Verify -->|verified| Load
-    Load --> Sup
-    Sup --> MA
-    Sup --> IR
-    MA <--> MT
-    MT --> DB
-    IR --> DB
-    Sup --> Save
-    Load --> Store
+    Verify -->|verified| Load[load_memory]
+    Load --> Sup[Supervisor]
+    Sup --> Music[Music sub-agent]
+    Sup --> Invoice[Invoice sub-agent]
+    Music --> DB[(Chinook SQLite)]
+    Invoice --> DB
+    Sup --> Save[create_memory]
+    Load --> Store[(InMemoryStore)]
     Save --> Store
-    Graph -. checkpoints .- Ckpt
-    Graph -->|final AIMessage| UI
-    UI --> User
+    Outer -->|final reply| UI
 ```
 
-### Agent Workflow
-
-```mermaid
-flowchart LR
-    Q[User Query] --> Sup[Supervisor]
-    Sup -->|music / catalog| M[Music Agent]
-    Sup -->|invoice / billing| I[Invoice Agent]
-    Sup -->|mixed| Both[Invoice first, then Music]
-    Sup -->|off-topic| Reject[Direct Refusal]
-
-    M -->|reason| M1[Pick Tool]
-    M1 -->|act| M2[Run SQL]
-    M2 -->|observe| M
-    M -->|done| R1[Music Answer]
-
-    I -->|reason| I1[Pick Tool]
-    I1 -->|act| I2[Run SQL]
-    I2 -->|observe| I
-    I -->|done| R2[Invoice Answer]
-
-    R1 --> Merge[Supervisor Merge]
-    R2 --> Merge
-    Both --> Merge
-    Reject --> Merge
-    Merge --> Out[Final Response]
-```
-
----
-
-## Pipeline Overview
-
-End-to-end lifecycle of a single user turn:
-
-```mermaid
-flowchart LR
-    A[1. User Types] --> B[2. UI Streams to Graph]
-    B --> C[3. Verify Identity]
-    C -->|found| D[4. Load Memory]
-    C -->|not found| C2[3a. Interrupt + Ask]
-    C2 --> C
-    D --> E[5. Supervisor Routes]
-    E --> F[6. Sub-Agent ReAct Loop]
-    F --> G[7. SQL via Parameterized Query]
-    G --> F
-    F --> H[8. Merge Sub-Agent Outputs]
-    H --> I[9. Update Memory]
-    I --> J[10. Render Response in UI]
-```
-
-Each stage is implemented as a distinct LangGraph node. No stage can be skipped; no stage can run out of order. The checkpointer snapshots state after every node so an interrupt can resume exactly where it paused.
-
----
-
-## LangGraph State Machine
-
-The outer graph is a strict finite state machine. It always enters at `verify_info` and always exits via `create_memory`.
-
-```mermaid
-stateDiagram-v2
-    [*] --> verify_info
-    verify_info --> human_input: should_interrupt == interrupt<br/>(customer_id is None)
-    human_input --> verify_info: user provides identifier
-    verify_info --> load_memory: should_interrupt == continue<br/>(customer_id set)
-    load_memory --> supervisor: preferences injected
-    supervisor --> create_memory: sub-agents returned
-    create_memory --> [*]
-```
-
-**Shared state** (`src/state.py`):
-
-```python
-class State(TypedDict):
-    customer_id: Optional[str]
-    messages: Annotated[list[AnyMessage], add_messages]
-    loaded_memory: str
-    remaining_steps: RemainingSteps
-```
-
-**Supervisor subgraph** (built by `langgraph-supervisor.create_supervisor`) dispatches to one of the sub-agents and merges their responses into `messages` via the `add_messages` reducer.
-
-**Music sub-agent subgraph** (hand-built, `src/agents/graph.py`):
-
-```mermaid
-stateDiagram-v2
-    [*] --> music_assistant
-    music_assistant --> music_tool_node: should_continue == continue<br/>(has tool_calls)
-    music_tool_node --> music_assistant
-    music_assistant --> [*]: should_continue == end<br/>(no tool_calls)
-```
-
-**Invoice sub-agent** is built via `langgraph.prebuilt.create_react_agent` - same pattern, wrapped for you.
-
----
-
-## Data Flow
-
-```mermaid
-flowchart LR
-    subgraph Input
-        U[User Message]
-    end
-
-    subgraph State
-        S[State TypedDict<br/>customer_id · messages<br/>loaded_memory]
-    end
-
-    subgraph Agents
-        V[verify_info<br/>structured LLM + DB]
-        LM[load_memory<br/>Store read]
-        SUP[Supervisor LLM]
-        MUS[Music ReAct]
-        INV[Invoice ReAct]
-        CM[create_memory<br/>structured LLM + Store write]
-    end
-
-    subgraph Tools
-        T1[5 music_tools]
-        T2[4 invoice_tools]
-    end
-
-    subgraph Data
-        DB[(Chinook SQLite)]
-        STORE[(InMemoryStore)]
-        CKPT[(MemorySaver)]
-    end
-
-    subgraph Output
-        R[AIMessage]
-        UI2[Gradio Chatbot]
-    end
-
-    U --> S
-    S --> V
-    V --> DB
-    V --> S
-    S --> LM
-    LM --> STORE
-    LM --> S
-    S --> SUP
-    SUP --> MUS
-    SUP --> INV
-    MUS --> T1 --> DB
-    INV --> T2 --> DB
-    DB --> T1 --> MUS
-    DB --> T2 --> INV
-    MUS --> SUP
-    INV --> SUP
-    SUP --> CM
-    CM --> STORE
-    SUP --> R
-    R --> UI2
-    S -. persisted per turn .- CKPT
-```
-
-**Invariants:**
-
-- Only `verify_info` writes `customer_id`. No sub-agent or tool mutates it.
-- Only tools touch `DB`. Neither the supervisor nor the verifier executes SQL directly (except the targeted lookups in `verify_info`).
-- `create_memory` only **unions** into `InMemoryStore`; deletions are not possible via this path.
-
----
-
-## Technology Stack
-
-| Layer | Technology | Version | Role |
-|---|---|---|---|
-| Language | Python | 3.12+ | Runtime |
-| UI | Gradio | 5.29+ | Chat interface, streaming, interrupts |
-| Agent Orchestration | LangGraph | 1.0+ | State machine, checkpointing, ToolNode |
-| Supervisor | langgraph-supervisor | 0.0.20+ | Hierarchical routing |
-| Prebuilt Agents | langgraph-prebuilt | 1.0+ | `create_react_agent`, `ToolNode` |
-| LLM Integration | langchain-openai | 1.0+ | `ChatOpenAI` (any OpenAI-compatible API) |
-| Core Framework | langchain + langchain-core + langchain-community | 1.0+ / 0.4+ | Messages, tools, SQLDatabase utility |
-| Data Validation | Pydantic | v2+ | `UserInput`, `UserProfile` schemas |
-| Database Engine | SQLAlchemy | 2.0+ | In-memory SQLite via `StaticPool` |
-| Dataset | Chinook | - | Customers, invoices, tracks, albums, artists |
-| Checkpointer | `langgraph.checkpoint.memory.MemorySaver` | - | Per-thread short-term state |
-| Store | `langgraph.store.memory.InMemoryStore` | - | Per-customer long-term memory |
-| Env Config | python-dotenv | 1.0+ | Loads `.env` |
-| HTTP | requests | 2.31+ | One-shot SQL script fetch |
-| Packaging | Docker | 3.12-slim | Reproducible deploy |
-| Hosting | Hugging Face Spaces | - | YAML-frontmatter driven |
-
----
-
-## Project Structure
-
-```
-Multi-Agent-Customer-Support/
-├── app.py                       # Entry point (local + HF Spaces: module-level app for HF import)
-├── Dockerfile                   # Python 3.12-slim, exposes :7860, runs app.py
-├── requirements.txt             # Pinned min versions
-├── .env.example                 # OPENAI_API_KEY, MODEL_NAME, TEMPERATURE, PORT
-├── Chinook_Sqlite.sql           # Cached dataset (auto-downloaded if missing)
-│
-├── src/
-│   ├── config.py                # Settings class; reads env, sets logging format
-│   ├── state.py                 # LangGraph State TypedDict
-│   ├── models.py                # Pydantic schemas: UserInput, UserProfile
-│   │
-│   ├── db/
-│   │   └── database.py          # SQLAlchemy engine, run_query_safe, normalize_phone, verify_database
-│   │
-│   ├── tools/
-│   │   ├── music_catalog.py     # 5 @tool functions (fuzzy SQL, deterministic sampling)
-│   │   └── invoice.py           # 4 @tool functions (customer-scoped queries)
-│   │
-│   ├── agents/
-│   │   ├── prompts.py           # All system prompts (supervisor, sub-agents, verification, memory)
-│   │   ├── nodes.py             # Graph node functions: verify_info, human_input, load_memory, create_memory, music_assistant, should_continue, should_interrupt
-│   │   └── graph.py             # build_graph(): assembles music subgraph, invoice ReAct, supervisor, outer graph
-│   │
-│   └── ui/
-│       ├── app.py               # Gradio Blocks, stream handler, status bar, reset button
-│       └── styles.py            # CUSTOM_CSS
-│
-└── tests/
-    ├── conftest.py              # DB fixture (session-scoped)
-    ├── test_database.py         # 11 tests: run_query_safe, normalize_phone, verify_database
-    └── test_tools.py            # 17 tests: all 9 tool functions
-```
-
-**Key files to read in order when grokking the repo:**
-
-1. `src/state.py` - the shared contract.
-2. `src/agents/graph.py` - how the whole thing is wired.
-3. `src/agents/nodes.py` - what each node does.
-4. `src/agents/prompts.py` - the behavioral contract for every LLM call.
-5. `src/tools/*.py` - the data surface.
-6. `src/ui/app.py` - how streaming + interrupts are surfaced.
-
----
-
-## Application Flow (Gradio UI)
+A typical verified turn looks like this end to end:
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant Gradio
-    participant Graph as LangGraph
-    participant Sub as Sub-Agent
-    participant SQL as SQLite
+    participant U as User
+    participant G as Gradio UI
+    participant LG as LangGraph
+    participant SUP as Supervisor
+    participant SUB as Sub-agent
+    participant DB as SQLite
 
-    User->>Gradio: type message + Enter
-    Gradio->>Gradio: show_user_message (optimistic render)
-    Gradio->>Graph: graph.stream(input, thread_id)
-    Graph->>Graph: verify_info
-    alt customer not verified
-        Graph-->>Gradio: interrupt (snapshot.next set)
-        Gradio->>User: "Waiting for your input"
-        User->>Gradio: identifier
-        Gradio->>Graph: resume
-    end
-    Graph->>Graph: load_memory
-    Graph->>Sub: supervisor routes
-    Sub->>SQL: parameterized query
-    SQL-->>Sub: rows (JSON)
-    Sub-->>Graph: AIMessage
-    Graph->>Graph: create_memory (union preferences)
-    Graph-->>Gradio: final AIMessage + elapsed
-    Gradio->>User: assistant reply + status "Responded in N.Ns · Data sources: …"
+    U->>G: Type a message, press Enter
+    G->>LG: graph.stream(input, thread_id)
+    LG->>LG: verify_info (already verified)
+    LG->>LG: load_memory
+    LG->>SUP: dispatch with state
+    SUP->>SUB: route by intent
+    SUB->>DB: parameterized SQL via tools
+    DB-->>SUB: rows (JSON)
+    SUB-->>SUP: AIMessage
+    SUP-->>LG: combined AIMessage
+    LG->>LG: create_memory (union into store)
+    LG-->>G: final AIMessage + elapsed
+    G->>U: assistant reply + status bar
 ```
 
-Every browser session is assigned a UUID `thread_id` stored in `gr.State`. This scopes the checkpointer so concurrent users never see each other's turns. The "New Conversation" button just rotates the UUID.
+A longer walkthrough (state machine diagrams, "what lives where" table, trust boundaries, invariants, performance notes, and roadmap) lives in [docs/architecture.md](docs/architecture.md).
 
----
+## Tech Stack
 
-## Pipeline Stages
+| Layer | Tool | Why it is here |
+|---|---|---|
+| Language | Python 3.12 | Modern type hints; latest version stable on Hugging Face Spaces (3.13 removes `audioop`, which transitive deps still import) |
+| UI | Gradio 5.29+ | Built-in chat component, streaming, easy deploy to Hugging Face Spaces |
+| Agent orchestration | LangGraph 1.0+ | State machines, conditional edges, checkpointing, `ToolNode`, `interrupt` |
+| Supervisor router | langgraph-supervisor 0.0.20+ | Hierarchical routing pattern out of the box |
+| Prebuilt ReAct | langgraph-prebuilt 1.0+ | `create_react_agent` for the invoice sub-agent |
+| LLM integration | langchain-openai 1.0+ | `ChatOpenAI` works against any OpenAI-protocol endpoint |
+| Core framework | langchain + langchain-core + langchain-community | Messages, tool decorator, `SQLDatabase` utility |
+| Data validation | Pydantic v2 | `UserInput`, `UserProfile` schemas for structured LLM output |
+| Database engine | SQLAlchemy 2.0+ | In-memory SQLite via `StaticPool`, safe parameter binding |
+| Sample dataset | Chinook | Realistic schema: customers, employees, invoices, tracks, albums, genres |
+| Checkpointer | `MemorySaver` | Per-thread short-term graph state |
+| Long-term store | `InMemoryStore` | Per-customer music preferences |
+| Env config | python-dotenv | Loads `.env` once at import |
+| HTTP client | requests 2.31+ | One-shot fetch of the Chinook SQL script on first run |
+| Container | Docker (python:3.12-slim) | Reproducible deploy |
+| Hosting | Hugging Face Spaces | YAML frontmatter at the top of this README configures the Space |
+| Test runner | pytest | 28 deterministic tests over SQL helpers and tools |
+| Lint | ruff | Configured in `pyproject.toml` |
+| Pre-commit | pre-commit + ruff + gitleaks | Whitespace, line endings, lint, format, secret scan |
+| CI | GitHub Actions | Lint, compile, pytest, gitleaks on every push and PR |
 
-Each node is a pure function over `State` (plus optional `store`/`config`). Stages in execution order:
+## Prerequisites
 
-### 1. `verify_info` - Identity Gate
-- **Input:** `messages`, maybe existing `customer_id`.
-- **If already verified:** no-op pass-through.
-- **Else:** calls `llm.with_structured_output(UserInput)` to pull one identifier (ID / email / phone). Runs a parameterized SQL lookup:
-  - numeric → `CustomerId =`
-  - contains `@` → `LOWER(Email) =`
-  - else → `normalize_phone()` compared against normalized DB phones.
-- **If found:** writes `customer_id` and a `SystemMessage` announcing the verified ID.
-- **If not found:** invokes a polite re-prompt LLM using `VERIFICATION_PROMPT`.
+- **Python 3.12.** Tested on 3.12.x. Python 3.13 is currently blocked because the Gradio dependency chain still imports `audioop`, which 3.13 removed.
+- **An OpenAI-compatible chat completions endpoint and API key.** OpenAI, Groq, Together AI, Azure OpenAI, LM Studio, Ollama, and vLLM all work.
+- **Git.**
+- **Docker** (optional, only for the container path).
+- Approximately **300 MB free disk** for dependencies and the Chinook SQL cache.
 
-### 2. `human_input` - Interrupt
-- Calls LangGraph `interrupt("Please provide input.")`. The UI receives this via `snapshot.next` and pauses the turn. When the user replies, the graph resumes and loops back to `verify_info`.
+The project does not need a GPU; latency is dominated by the LLM provider's response time.
 
-### 3. `load_memory` - Preference Hydration
-- Reads `("memory_profile", customer_id)` from `InMemoryStore`.
-- Formats as `"Music Preferences: rock, AC/DC, jazz"` and sets `loaded_memory`.
-- The music agent's prompt interpolates this string so it can personalize without re-asking.
+## Installation
 
-### 4. `supervisor` - Hierarchical Router
-- Built via `langgraph_supervisor.create_supervisor`.
-- Routing rules (encoded in `SUPERVISOR_PROMPT`):
-  - music/catalog → `music_catalog_subagent`
-  - invoice/purchase/billing → `invoice_information_subagent`
-  - mixed → invoice first, then music
-  - off-topic → direct refusal, no sub-agent invoked
-- Merges sub-agent outputs into a single coherent response. Never adds information not present in sub-agent outputs.
-
-### 5a. `music_catalog_subagent` - Hand-Built ReAct
-- Custom `StateGraph` with two nodes: `music_assistant` (LLM with bound tools) and `music_tool_node` (`ToolNode(music_tools)`).
-- Conditional edge `should_continue` loops until there are no `tool_calls` left.
-- System prompt is generated per call via `generate_music_assistant_prompt(loaded_memory)` so preferences are fresh.
-
-### 5b. `invoice_information_subagent` - Prebuilt ReAct
-- Built via `langgraph.prebuilt.create_react_agent(llm, tools=invoice_tools, prompt=INVOICE_SUBAGENT_PROMPT, state_schema=State)`.
-- Prompt explicitly tells it to use the **verified** `customer_id` from the `SystemMessage`, not any ID the user mentions.
-
-### 6. `create_memory` - Preference Capture
-- Summarizes last 10 messages.
-- `llm.with_structured_output(UserProfile)` extracts **explicit** preferences.
-- Unions with existing preferences; if the LLM returns empty but there are existing preferences, the write is **skipped** (never erases).
-- Writes back to `InMemoryStore`.
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- Python **3.12** (Python 3.13 is blocked on HF Spaces because Python 3.13 removes `audioop`).
-- An OpenAI API key *or* any OpenAI-compatible endpoint (Groq, Together, Azure OpenAI, LM Studio, Ollama…).
-- Git.
-
-### Quick Start
+### Option A: virtualenv
 
 ```bash
-# 1. Clone
 git clone https://github.com/ANI-IN/Multi-Agent-Customer-Support.git
 cd Multi-Agent-Customer-Support
 
-# 2. Virtualenv
 python3.12 -m venv venv
-source venv/bin/activate            # Windows: venv\Scripts\activate
+source venv/bin/activate          # Windows: venv\Scripts\activate
 
-# 3. Deps
+pip install --upgrade pip
 pip install -r requirements.txt
 
-# 4. Config
 cp .env.example .env
-# edit .env → set OPENAI_API_KEY
+# Edit .env and set OPENAI_API_KEY.
 
-# 5. Run
 python app.py
-# → http://localhost:7860
+# Open http://localhost:7860
 ```
 
-**First-run chat script:**
-```
-> My customer ID is 5
-> What AC/DC albums do you have?
-> Show me my most expensive purchase.
-> I love rock music.            # saved to memory
-# ... restart the app, verify again as customer 5 ...
-> What genres do you think I'd like?
-```
-
-### Sample Dataset
-
-The app boots against the [Chinook sample database](https://github.com/lerocha/chinook-database), loaded into an in-memory SQLite instance via SQLAlchemy `StaticPool`. On first run it reads `Chinook_Sqlite.sql` from the repo root; if missing, it downloads and caches it.
-
-| Table | Rows | Notes |
-|---|---:|---|
-| Customer | 59 | PII + `SupportRepId` FK to Employee |
-| Employee | 8 | Support reps |
-| Invoice | 412 | `CustomerId`, `InvoiceDate`, `Total` |
-| InvoiceLine | 2,240 | Each row = one purchased track |
-| Track | 3,503 | `AlbumId`, `GenreId`, `MediaTypeId`, `UnitPrice` |
-| Album | 347 | `ArtistId` FK |
-| Artist | 275 | - |
-| Genre | 25 | - |
-| MediaType | 5 | - |
-| Playlist / PlaylistTrack | 18 / 8,715 | Not currently exposed as tools |
-
-### Developer Commands
+### Option B: Docker
 
 ```bash
-# Run app
-python app.py
-
-# Full test suite (28 tests)
-pytest tests/ -v
-
-# Only DB layer
-pytest tests/test_database.py -v
-
-# Only tools
-pytest tests/test_tools.py -v
-
-# Docker build + run
 docker build -t music-support .
-docker run -p 7860:7860 -e OPENAI_API_KEY=sk-... music-support
 
-# Quick sanity check without the UI
-python -c "from src.db.database import verify_database; print(verify_database())"
+docker run --rm -p 7860:7860 \
+  -e OPENAI_API_KEY=sk-... \
+  -e MODEL_NAME=gpt-4o-mini \
+  music-support
 ```
 
----
+### Option C: Docker Compose
+
+```bash
+cp .env.example .env
+# Edit .env.
+
+docker compose up --build
+```
+
+The compose file (`docker-compose.yml`) reads `.env`, restarts on failure, and exposes a basic healthcheck on port `7860`.
+
+### Hugging Face Spaces
+
+The YAML frontmatter at the top of this README is the Space configuration. Push the repository to a Gradio Space, set `OPENAI_API_KEY` under **Settings -> Repository Secrets**, and HF builds and runs `app.py` automatically. Python is pinned to 3.12.
 
 ## Configuration
 
-All configuration is env-driven. `src/config.py` loads `.env` once at import time.
+All configuration is environment-driven. `src/config.py` calls `load_dotenv()` once at import.
 
-| Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `OPENAI_API_KEY` | yes | - | API key for the LLM provider |
-| `OPENAI_API_BASE` | no | - | Override base URL for non-OpenAI providers |
-| `MODEL_NAME` | no | `gpt-4o-mini` | Chat model name |
-| `TEMPERATURE` | no | `0` | `0` = fully deterministic routing |
-| `PORT` | no | `7860` | Gradio port |
+### Environment variables
 
-### LLM Provider (Pick One)
+| Variable | Required | Default | Where it is read | Notes |
+|---|---|---|---|---|
+| `OPENAI_API_KEY` | yes | empty | `src/config.py:15` | Sensitive. Never commit. |
+| `OPENAI_API_BASE` | no | empty | `src/config.py:16` | Override for any OpenAI-protocol provider |
+| `MODEL_NAME` | no | `gpt-4o-mini` | `src/config.py:17` | Chat model identifier |
+| `TEMPERATURE` | no | `0` | `src/config.py:18` | `0` keeps routing deterministic; raise carefully |
+| `PORT` | no | `7860` | `src/config.py:19` | Gradio HTTP port |
 
-The project uses `ChatOpenAI`, which speaks the OpenAI protocol. Any compatible provider works by setting `OPENAI_API_BASE`.
+### Knobs in code
+
+Tunables that are intentionally not environment variables, listed with where to change them.
+
+| Knob | File | Notes |
+|---|---|---|
+| App title and welcome blurb | `src/config.py:20-25` | Shown in the Gradio header |
+| Music-agent sample limit (20 tracks) | `src/tools/music_catalog.py:80` | `LIMIT 20` on `get_tracks_by_artist` |
+| Genre-sample limit (10 artists) | `src/tools/music_catalog.py:141` | `LIMIT 10` in the deterministic CTE |
+| Song-title-search limit (10 hits) | `src/tools/music_catalog.py:187` | `LIMIT 10` on `check_for_songs` |
+| Memory window for preference extraction | `src/agents/nodes.py:203` | `state["messages"][-10:]` |
+| Status-bar colors and icons | `src/ui/app.py:47-76` | `_status_html` |
+| UI theme and font | `src/ui/app.py:179-184` | `gr.themes.Soft(..., font=gr.themes.GoogleFont("Inter"))` |
+
+### Provider configuration
+
+The project speaks the OpenAI protocol. To use a non-OpenAI provider, set both `OPENAI_API_BASE` and `OPENAI_API_KEY`.
 
 <details>
-<summary><b>OpenAI (default)</b></summary>
+<summary>OpenAI (default)</summary>
 
 ```env
 OPENAI_API_KEY=sk-...
@@ -555,7 +341,7 @@ MODEL_NAME=gpt-4o-mini
 </details>
 
 <details>
-<summary><b>Groq</b></summary>
+<summary>Groq</summary>
 
 ```env
 OPENAI_API_BASE=https://api.groq.com/openai/v1
@@ -565,7 +351,7 @@ MODEL_NAME=llama-3.3-70b-versatile
 </details>
 
 <details>
-<summary><b>Together AI</b></summary>
+<summary>Together AI</summary>
 
 ```env
 OPENAI_API_BASE=https://api.together.xyz/v1
@@ -575,7 +361,7 @@ MODEL_NAME=meta-llama/Llama-3.3-70B-Instruct-Turbo
 </details>
 
 <details>
-<summary><b>Azure OpenAI</b></summary>
+<summary>Azure OpenAI</summary>
 
 ```env
 OPENAI_API_BASE=https://your-resource.openai.azure.com/
@@ -585,7 +371,7 @@ MODEL_NAME=your-deployment-name
 </details>
 
 <details>
-<summary><b>Local (LM Studio / Ollama / vLLM)</b></summary>
+<summary>Local (LM Studio / Ollama / vLLM)</summary>
 
 ```env
 OPENAI_API_BASE=http://localhost:1234/v1
@@ -594,157 +380,262 @@ MODEL_NAME=your-local-model
 ```
 </details>
 
-> **Tip:** The supervisor relies on the model following structured routing instructions. Models smaller than ~7B may degrade routing accuracy on mixed queries.
+Routing depends on the model following structured instructions. Models below roughly seven billion parameters often degrade on mixed-intent queries.
 
----
+## Running the App
 
-## Tools Reference
-
-### Music Catalog Tools (`src/tools/music_catalog.py`)
-
-| Tool | Signature | Returns |
-|---|---|---|
-| `get_albums_by_artist` | `(artist: str)` | Album rows, fuzzy `LIKE '%artist%'` |
-| `get_tracks_by_artist` | `(artist: str)` | Total count + up to 20 full-detail tracks |
-| `get_songs_by_genre` | `(genre: str)` | Total count + 1 track per artist (up to 10), deterministic via `ROW_NUMBER()` CTE |
-| `check_for_songs` | `(song_title: str)` | Up to 10 full-detail matches on track name |
-| `get_track_details` | `(track_id: str)` | Every column for one track including computed `SizeMB` |
-
-### Invoice Tools (`src/tools/invoice.py`)
-
-| Tool | Signature | Returns |
-|---|---|---|
-| `get_invoices_by_customer_sorted_by_date` | `(customer_id: str)` | All invoices DESC by date |
-| `get_invoice_line_items_sorted_by_price` | `(customer_id: str)` | All purchased **tracks** (not invoices) DESC by unit price |
-| `get_employee_by_invoice_and_customer` | `(invoice_id, customer_id)` | Support rep name / title / email |
-| `get_invoice_line_items` | `(invoice_id, customer_id)` | Full track details for one invoice |
-
-All tool inputs pass through `_safe_int()` for numeric args. All return values are either JSON-serialized row lists or a human-readable "not found" string. Empty results are never silently collapsed.
-
----
-
-## Prompt Engineering & Anti-Hallucination
-
-Grounding rules (applied to every sub-agent prompt in `src/agents/prompts.py`):
-
-1. **Tool-only** - never answer from model memory; always call a tool first.
-2. **Exact quoting** - no rounding, no estimating, no "about".
-3. **Honest failures** - "I could not find that in our catalog." is the literal fallback.
-4. **Scope boundaries** - each sub-agent explicitly refuses out-of-scope queries and defers.
-5. **Truncation transparency** - when results are sampled (LIMIT), say so and include the total.
-6. **No invented IDs** - the invoice agent is told to read the verified `customer_id` from the `SystemMessage`, not from user text.
-
-Memory rules (`CREATE_MEMORY_PROMPT`):
-
-- Only **explicit** statements count ("I love jazz" ✅; "Do you have jazz?" ❌).
-- New preferences **merge** with existing (set union).
-- If the LLM returns empty but prior preferences exist, **skip the write**.
-
----
-
-## Security
-
-| Threat | Mitigation |
-|---|---|
-| SQL injection | Every query uses SQLAlchemy `text(...)` with bound `:name` parameters. No f-strings or concatenation. |
-| Cross-customer data leak | `customer_id` is set only by `verify_info` and passed via `SystemMessage`. Invoice tools require it as a typed parameter. |
-| Hallucinated accounts | Verification looks up against the real `Customer` table; unknown IDs produce a polite retry prompt, not a pass-through. |
-| Numeric crashes | `_safe_int()` wraps every numeric tool arg and returns a friendly error instead of propagating `ValueError`. |
-| Phone format bypass | `normalize_phone()` strips non-digits (preserving `+`), so `+1 (555) 123-4567` matches `15551234567`. |
-| Thread cross-talk | Gradio issues a UUID `thread_id` per session; the checkpointer is scoped to it. |
-
----
-
-## Testing
-
-**28 pytest tests**, all deterministic, all hit the real in-memory DB.
+After installation:
 
 ```bash
-pytest tests/ -v
+python app.py
+# Then open http://localhost:7860
 ```
 
-| File | Tests | Coverage |
-|---|---:|---|
-| `tests/test_database.py` | 11 | `run_query_safe` (happy path, params, empty, JSON shape), `normalize_phone` (intl, domestic, dashes, empty, None, `+` prefix), `verify_database` |
-| `tests/test_tools.py` | 17 | All 5 music tools + all 4 invoice tools; found / not-found / invalid-id / determinism / DESC-date ordering |
+The console prints structured log lines for each graph event. Look for:
 
-Notable determinism check:
+- `LLM initialized: gpt-4o-mini, temperature=0` at startup.
+- `Database verification OK.` on first request.
+- `Graph event: node=verify_info` and similar for each node invocation.
+- `TOOL_CALL: <tool_name> | <args>` and `TOOL_RESULT: <tool_name> | result_length=N` per tool execution.
+
+You can also import and drive the graph headlessly:
 
 ```python
-def test_get_songs_by_genre_deterministic(self):
-    r1 = get_songs_by_genre.invoke({"genre": "Rock"})
-    r2 = get_songs_by_genre.invoke({"genre": "Rock"})
-    assert r1 == r2
+from langchain_core.messages import HumanMessage
+from src.agents.graph import build_graph
+from src.config import settings
+
+graph, _, _ = build_graph(
+    model_name=settings.model_name,
+    temperature=settings.temperature,
+    openai_api_key=settings.openai_api_key or None,
+    openai_api_base=settings.openai_api_base or None,
+)
+
+config = {"configurable": {"thread_id": "demo"}}
+for event in graph.stream(
+    {"messages": [HumanMessage(content="My customer ID is 5")]},
+    config=config,
+    stream_mode="updates",
+):
+    print(event)
 ```
 
----
+## Using the App Step by Step
 
-## Deployment
+1. Start the server. The status bar shows `Ready - type a message to begin`.
+2. Identify yourself. Type one of:
+   - A customer ID: `My customer ID is 5`
+   - An email: `frantisekw@jetbrains.com`
+   - A phone number: `+55 (12) 3923-5555`
+3. The graph runs `verify_info`. If the identifier matches a Chinook customer, you are verified and the status switches to `Responded in N.Ns`. If not, the agent re-prompts.
+4. Ask a music catalog question. Examples:
+   - `What AC/DC albums do you have?`
+   - `Show me Jazz tracks.`
+   - `Find the song "Balls to the Wall".`
+5. Ask an invoice question. Examples:
+   - `What was my most recent invoice?`
+   - `Which track did I pay the most for?`
+   - `Who helped me on invoice 382?`
+6. Express a preference. The next line is captured and persisted to the in-memory store:
+   - `I love rock music.`
+7. Ask the assistant to recall later in the session:
+   - `What genres do you think I would like?`
+8. Click **New Conversation** to clear chat history and rotate the thread ID. (Persisted preferences for the same `customer_id` carry across `New Conversation` clicks, since they are scoped per-customer, not per-thread. Restarting the process clears them.)
 
-### Hugging Face Spaces
+## Code Walkthrough
 
-This README's YAML frontmatter is the HF Spaces config. Push the repo to a Gradio Space, set `OPENAI_API_KEY` in **Settings → Repository Secrets**, and HF builds and runs `app.py` automatically. Python is pinned to 3.12 (3.13 breaks `audioop` imports pulled in transitively).
+Read the files in this order to learn the codebase quickly.
 
-### Docker
+| Step | File | Lines | What you learn |
+|---|---|---|---|
+| 1 | `src/state.py` | 1-12 | The shared state contract used by every node |
+| 2 | `src/agents/graph.py` | 26-129 | How the music subgraph, the invoice ReAct agent, and the supervisor are composed into one outer state machine |
+| 3 | `src/agents/nodes.py` | 79-158 | The two core nodes: `music_assistant` and `verify_info` |
+| 4 | `src/agents/nodes.py` | 24-66 | How identifiers (numeric, email, normalized phone) are resolved to a `customer_id` |
+| 5 | `src/agents/nodes.py` | 166-234 | Memory load and memory union-write semantics |
+| 6 | `src/agents/prompts.py` | 1-156 | The behavioral contracts for every LLM call: grounding rules, refusal text, memory rules |
+| 7 | `src/tools/music_catalog.py` | 18-238 | Five tools, including the deterministic genre sample with `ROW_NUMBER()` |
+| 8 | `src/tools/invoice.py` | 18-146 | Four customer-scoped invoice tools |
+| 9 | `src/db/database.py` | 13-107 | Engine bootstrap, `run_query_safe`, `normalize_phone`, `verify_database` |
+| 10 | `src/ui/app.py` | 94-170 | Gradio stream handler: how `snapshot.next` is used to detect a paused interrupt and resume cleanly |
 
-```bash
-docker build -t music-support .
-docker run -d \
-  -p 7860:7860 \
-  -e OPENAI_API_KEY=sk-... \
-  -e MODEL_NAME=gpt-4o-mini \
-  --name music-support \
-  --restart unless-stopped \
-  music-support
-```
+Pipeline stages in execution order:
 
-### Docker Compose
+- **`verify_info`** (`src/agents/nodes.py:114-158`). Calls `llm.with_structured_output(UserInput)` to extract one identifier, then runs a parameterized lookup against `Customer`. On success, writes `customer_id` and announces it in a `SystemMessage`. On failure, asks again using `VERIFICATION_PROMPT`.
+- **`human_input`** (`src/agents/nodes.py:161-163`). Calls LangGraph `interrupt("Please provide input.")`. The UI surfaces this as a waiting state.
+- **`load_memory`** (`src/agents/nodes.py:166-181`). Reads `("memory_profile", customer_id)` from the long-term store and sets `loaded_memory`.
+- **`supervisor`** (built in `src/agents/graph.py:86-98`). Routes by intent following `SUPERVISOR_PROMPT`: music or invoice, mixed (invoice first), or off-topic refusal.
+- **`music_catalog_subagent`** (built in `src/agents/graph.py:53-68`). Hand-built ReAct loop: LLM-with-tools node plus a `ToolNode(music_tools)` and a `should_continue` conditional edge.
+- **`invoice_information_subagent`** (built in `src/agents/graph.py:72-80`). `langgraph.prebuilt.create_react_agent` with `invoice_tools`. The prompt insists the verified customer ID comes from the `SystemMessage`, not from user text.
+- **`create_memory`** (`src/agents/nodes.py:184-234`). Summarizes the last 10 messages, extracts preferences via `llm.with_structured_output(UserProfile)`, and writes the set union into the store. Empty LLM output against a non-empty existing profile is a no-op (never erases).
 
-```yaml
-services:
-  music-support:
-    build: .
-    ports: ["7860:7860"]
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - MODEL_NAME=gpt-4o-mini
-      - TEMPERATURE=0
-    restart: unless-stopped
-```
+## Sample Data
 
----
+The application boots against the [Chinook sample database](https://github.com/lerocha/chinook-database), loaded into an in-memory SQLite instance via `StaticPool`. On first run the SQL script is read from `Chinook_Sqlite.sql` at the repo root; if missing, it is downloaded and cached.
+
+| Table | Rows | Purpose | Tools that read it |
+|---|---:|---|---|
+| Customer | 59 | Identity, address, support rep FK | `verify_info` |
+| Employee | 8 | Support rep details | `get_employee_by_invoice_and_customer` |
+| Invoice | 412 | Billing header | `get_invoices_by_customer_sorted_by_date`, `get_employee_by_invoice_and_customer` |
+| InvoiceLine | 2,240 | One purchased track per row | `get_invoice_line_items*` |
+| Track | 3,503 | Catalog row | All music and invoice tools |
+| Album | 347 | Album row | `get_albums_by_artist`, `get_tracks_by_artist` |
+| Artist | 275 | Artist row | All music tools |
+| Genre | 25 | Genre row | `get_songs_by_genre`, `get_track_details` |
+| MediaType | 5 | Format (MPEG, AAC, etc.) | `get_tracks_by_artist`, `get_track_details` |
+| Playlist | 18 | Curated lists | Not currently exposed |
+| PlaylistTrack | 8,715 | Join table | Not currently exposed |
+
+### Try asking
+
+Once verified (start with `My customer ID is 5`), the following questions all return real, grounded answers.
+
+| Try asking | What it exercises |
+|---|---|
+| `What AC/DC albums do you have?` | `get_albums_by_artist` |
+| `Show me tracks by Iron Maiden.` | `get_tracks_by_artist` (with total + sample) |
+| `What jazz songs are in the catalog?` | `get_songs_by_genre` (deterministic CTE) |
+| `Find "Balls to the Wall".` | `check_for_songs` |
+| `What was my last invoice?` | `get_invoices_by_customer_sorted_by_date` |
+| `Which track did I pay the most for?` | `get_invoice_line_items_sorted_by_price` |
+| `Who was the support rep on my last invoice?` | `get_invoices_by_customer_sorted_by_date` then `get_employee_by_invoice_and_customer` |
+| `What tracks were on invoice 382?` | `get_invoice_line_items` |
+| `I love jazz.` | `create_memory` union write |
+| `What's the weather today?` | Supervisor off-topic refusal (no sub-agent called) |
+
+## Customization
+
+Common changes a maintainer is likely to make, paired with the file and line range to edit.
+
+| Change | File:lines |
+|---|---|
+| Switch the default model | `src/config.py:17` |
+| Raise or lower the LLM temperature | `src/config.py:18` |
+| Increase the sample size for `get_tracks_by_artist` | `src/tools/music_catalog.py:80` |
+| Increase the sample size for `get_songs_by_genre` | `src/tools/music_catalog.py:141` |
+| Add a new music tool | `src/tools/music_catalog.py` (add `@tool` function, then append to `music_tools` list at the end of the file) |
+| Add a new invoice tool | `src/tools/invoice.py` (same pattern; remember `_safe_int` for numeric args) |
+| Replace `MemorySaver` with `SqliteSaver` | `src/agents/graph.py:47` |
+| Replace `InMemoryStore` with a persistent store | `src/agents/graph.py:46` |
+| Change the supervisor routing rules | `src/agents/prompts.py:82-105` |
+| Adjust how many recent messages feed memory extraction | `src/agents/nodes.py:203` |
+| Restyle the chat UI | `src/ui/styles.py` |
+| Add a new top-of-page link or banner | `src/ui/app.py:189-196` |
+| Pin a different Python version on Hugging Face Spaces | the YAML frontmatter at the top of this README (`python_version: "3.12"`) |
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ModuleNotFoundError: gradio` | Deps not installed | `pip install -r requirements.txt` |
-| `ModuleNotFoundError: audioop` | Python 3.13 | Use Python 3.12 |
-| `ImportError: HfFolder` | Old Gradio | `gradio>=5.29.0` |
-| `TypeError: argument of type 'bool' is not iterable` | Gradio/client schema bug | `gradio>=5.29.0` |
-| `OPENAI_API_KEY not set` | Missing `.env` | `cp .env.example .env` + edit |
-| Downloads Chinook on every start | Cache file missing | First run caches it; subsequent runs read locally |
-| Verification keeps failing | No matching customer | Try Customer ID `5` (known to exist); or a real Chinook email / phone |
+| `ModuleNotFoundError: gradio` (or langchain, langgraph) | Dependencies are not installed in the active environment | `pip install -r requirements.txt` |
+| `ModuleNotFoundError: audioop` | Running on Python 3.13, which removed `audioop` | Use Python 3.12; recreate the venv with `python3.12 -m venv venv` |
+| App boots but says `OPENAI_API_KEY not set` | The `.env` file is missing or the key is empty | `cp .env.example .env` and set `OPENAI_API_KEY` |
+| Verification keeps failing for a real ID | The identifier does not match any Chinook customer | Try customer ID `5` (Frantisek Wichterlova), email `luisg@embraer.com.br`, or phone `+55 (12) 3923-5555` |
+| First start hangs for a few seconds | `Chinook_Sqlite.sql` is being downloaded and cached | One-time cost; subsequent runs read the cache |
+| Docker container is unreachable on `http://localhost:7860` | The container is bound to `127.0.0.1` inside, which is not the host's loopback | The Dockerfile already binds to `0.0.0.0`; confirm `-p 7860:7860` is on your `docker run` command |
+| Gradio raises `TypeError: argument of type 'bool' is not iterable` at startup | Stale Gradio / gradio-client schema bug | Upgrade to `gradio>=5.29.0` (already pinned in `requirements.txt`); reinstall with `pip install -U -r requirements.txt` |
+| Routing sometimes sends invoice questions to the music agent | A small or local model is misreading the supervisor prompt | Set `TEMPERATURE=0`, switch to a stronger model, or set `OPENAI_API_BASE` to a hosted provider |
+| Memory does not persist after restart | Both the checkpointer and the long-term store are in-memory by design | Swap `MemorySaver` and `InMemoryStore` in `src/agents/graph.py:46-47` for persistent backends |
+| `pytest` is missing | Developer tools not installed | `pip install pytest` (the test runner is not a runtime dependency) |
 
----
+## Project Structure
 
-## Roadmap
+```
+Multi-Agent-Customer-Support/
+|-- app.py                       # Entry point for local dev and Hugging Face Spaces
+|-- Dockerfile                   # Python 3.12-slim image, exposes :7860
+|-- docker-compose.yml           # Local compose service with healthcheck (added)
+|-- requirements.txt             # Runtime dependencies (pinned floors)
+|-- pyproject.toml               # ruff, black, and pytest configuration (added)
+|-- .env.example                 # Placeholder environment variables
+|-- .editorconfig                # Whitespace and line-ending defaults (added)
+|-- .pre-commit-config.yaml      # Pre-commit hooks: ruff, gitleaks, basics (added)
+|-- .gitignore                   # Excludes .env, caches, Chinook SQL, .claude/
+|-- .dockerignore                # Trims context for image builds
+|-- LICENSE                      # MIT (added)
+|-- CHANGELOG.md                 # Keep-a-Changelog format (added)
+|-- CODE_OF_CONDUCT.md           # Contributor Covenant v2.1 (added)
+|-- CONTRIBUTING.md              # Setup, style, PR conventions (added)
+|-- SECURITY.md                  # Private disclosure path and known risk areas (added)
+|-- README.md                    # This document
+|
+|-- .github/
+|   |-- workflows/
+|   |   `-- ci.yml               # Lint + compile + pytest + gitleaks (added)
+|   |-- ISSUE_TEMPLATE/
+|   |   |-- bug_report.md        # (added)
+|   |   `-- feature_request.md   # (added)
+|   `-- PULL_REQUEST_TEMPLATE.md # (added)
+|
+|-- docs/
+|   |-- architecture.md          # Flowchart, sequence, what-lives-where, invariants (added)
+|   `-- getting-started.md       # venv / Docker / Compose paths (added)
+|
+|-- src/
+|   |-- __init__.py
+|   |-- config.py                # Settings class; reads env, sets logging
+|   |-- state.py                 # LangGraph State TypedDict
+|   |-- models.py                # Pydantic schemas: UserInput, UserProfile
+|   |-- db/
+|   |   |-- __init__.py          # Re-exports the public DB API
+|   |   `-- database.py          # Engine, run_query_safe, normalize_phone, verify_database
+|   |-- tools/
+|   |   |-- __init__.py          # Re-exports music_tools, invoice_tools
+|   |   |-- music_catalog.py     # 5 @tool functions (fuzzy SQL, deterministic sampling)
+|   |   `-- invoice.py           # 4 @tool functions (customer-scoped queries)
+|   |-- agents/
+|   |   |-- __init__.py
+|   |   |-- prompts.py           # All system prompts (supervisor, sub-agents, verification, memory)
+|   |   |-- nodes.py             # verify_info, human_input, load_memory, create_memory, music_assistant, helpers
+|   |   `-- graph.py             # build_graph(): subgraphs, supervisor, outer graph
+|   `-- ui/
+|       |-- __init__.py
+|       |-- app.py               # Gradio Blocks, stream handler, status bar, reset button
+|       `-- styles.py            # Custom CSS
+|
+`-- tests/
+    |-- __init__.py
+    |-- conftest.py              # Session-scoped DB fixture
+    |-- test_database.py         # 11 tests: run_query_safe, normalize_phone, verify_database
+    `-- test_tools.py            # 17 tests: every music and invoice tool, found / not-found / determinism
+```
 
-- Persistent storage: swap `MemorySaver` → `SqliteSaver`; swap `InMemoryStore` → Postgres- or Redis-backed store.
-- Token streaming in the UI (currently streams at node-event granularity).
-- Playlist and customer-profile tools (tables present, tools not yet exposed).
-- Structured JSON logs with correlation IDs per `thread_id` + latency metrics.
-- CI pipeline (GitHub Actions) running `pytest` on every PR.
-- Per-session rate limiting at the UI boundary.
+Files marked **(added)** in the tree above are new in this revision. The application code under `src/`, the test suite under `tests/`, and the original `app.py`, `Dockerfile`, `.dockerignore`, `.gitignore`, `.env.example`, and `requirements.txt` were not modified.
 
----
+## Security Notes
+
+This project takes a few defensive postures worth knowing about:
+
+- All SQL is parameterized via SQLAlchemy `text()` with bound parameters. There is no f-string or concatenation against user input anywhere.
+- The `customer_id` field is written exactly once by `verify_info` after a database lookup. Sub-agents and tools read it but never set it.
+- The invoice sub-agent's prompt explicitly tells the model to use the verified customer ID from the `SystemMessage`, not from user text.
+- `create_memory` is a set union; an empty LLM result against a non-empty profile is a no-op, so a hallucinated empty response cannot erase preferences.
+- `.gitignore` excludes `.env`, `*.db`, and cache directories so secrets and local data do not get committed.
+- A `gitleaks` scan runs both as a pre-commit hook (see `.pre-commit-config.yaml`) and in CI (see `.github/workflows/ci.yml`).
+
+Full disclosure process and a description of each sensitive surface live in [SECURITY.md](SECURITY.md). Please do not file public issues for vulnerabilities; use the private security advisory link in `SECURITY.md` instead.
+
+## Contributing
+
+Pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the local setup, code style, test expectations, and PR conventions, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community norms. In short:
+
+- Use Python 3.12 and `pip install -r requirements.txt`.
+- Install the developer toolchain with `pip install ruff pytest pre-commit` and run `pre-commit install`.
+- Keep PRs focused; one logical change per commit.
+- Add or update tests for behavior changes.
+- Use Conventional Commits in commit subjects.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+This project is released under the MIT License. See [LICENSE](LICENSE) for the full text.
 
----
+## Acknowledgments
 
-<div align="center">
-  <sub>Built and maintained by <b>Animesh Kumar</b> · LangGraph · Gradio · Chinook</sub>
-</div>
+- [LangGraph](https://github.com/langchain-ai/langgraph) for the graph orchestration primitives, checkpointing, and `interrupt` semantics that make human-in-the-loop turns trivial.
+- [LangChain](https://github.com/langchain-ai/langchain) for `ChatOpenAI`, the `@tool` decorator, and the `SQLDatabase` utility.
+- [Gradio](https://gradio.app) for the chat UI components, streaming primitives, and the painless deploy to Hugging Face Spaces.
+- [Chinook Database](https://github.com/lerocha/chinook-database) by Luis Rocha for a small, realistic schema that makes every example query meaningful.
+- [Pydantic](https://pydantic.dev) for the structured-output schemas that keep LLM outputs honest.
+- The Contributor Covenant for the Code of Conduct template.
