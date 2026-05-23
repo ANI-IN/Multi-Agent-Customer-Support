@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    image: music-support:local
+    container_name: music-support
+    ports:
+      - "7860:7860"
+    env_file:
+      - .env
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:7860', timeout=5).status < 500 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
